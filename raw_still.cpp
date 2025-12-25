@@ -74,259 +74,255 @@ static inline void unpack_raw10_csi2p_row(const uint8_t *rowPacked, int width, u
         rowOut[x++] = uint16_t(b3) | (uint16_t((b4 >> 6) & 0x03) << 8);
     }
 }
-class OneShotRawCapture {
+class PersistentRawCapture {
 public:
-    unsigned short **capture_bayer_u16(int exposure_us) {
+    PersistentRawCapture(int reqW = 2592, int reqH = 1944, int bufferCount = 6, int warmupFrames = 3)
+        : reqW_(reqW), reqH_(reqH), bufferCount_(bufferCount), warmupFrames_(warmupFrames) {
         using namespace libcamera;
 
-        CameraManager cm;
-        if (cm.start() != 0) throw std::runtime_error("CameraManager start() failed");
-        if (cm.cameras().empty()) throw std::runtime_error("No cameras available");
+        if (cm_.start() != 0)
+            throw std::runtime_error("CameraManager start() failed");
+        if (cm_.cameras().empty())
+            throw std::runtime_error("No cameras available");
 
-        std::shared_ptr<Camera> cam = cm.cameras().front();
-        if (cam->acquire() != 0) throw std::runtime_error("Camera acquire() failed");
+        cam_ = cm_.cameras().front();
+        if (cam_->acquire() != 0)
+            throw std::runtime_error("Camera acquire() failed");
 
-        std::unique_ptr<CameraConfiguration> cfg =
-            cam->generateConfiguration({ StreamRole::Raw });
-        if (!cfg) throw std::runtime_error("generateConfiguration(Raw) failed");
+        cfg_ = cam_->generateConfiguration({ StreamRole::Raw });
+        if (!cfg_)
+            throw std::runtime_error("generateConfiguration(Raw) failed");
 
-        StreamConfiguration &rawCfg = cfg->at(0);
-
-        // Request full-res still
-        rawCfg.size.width  = 2592;
-        rawCfg.size.height = 1944;
-
-        // Prefer RAW10 packed Bayer. Pipeline may choose a different Bayer order;
-        // but it should remain RAW10 CSI2P for OV5647.
+        libcamera::StreamConfiguration &rawCfg = cfg_->at(0);
+        rawCfg.size.width  = reqW_;
+        rawCfg.size.height = reqH_;
         rawCfg.pixelFormat = formats::SGBRG10_CSI2P;
-        // Use 2 buffers so we can capture a dummy frame first and discard it.
-        rawCfg.bufferCount = 2;
+        rawCfg.bufferCount = bufferCount_;
 
-        if (cfg->validate() == CameraConfiguration::Invalid)
+        if (cfg_->validate() == CameraConfiguration::Invalid)
             throw std::runtime_error("Invalid camera configuration");
-
-        if (cam->configure(cfg.get()) != 0)
+        if (cam_->configure(cfg_.get()) != 0)
             throw std::runtime_error("Camera configure() failed");
+
+        rawStream_ = rawCfg.stream();
+        if (!rawStream_)
+            throw std::runtime_error("raw stream null");
+
+        // Read back what we actually got.
+        W_ = rawCfg.size.width;
+        H_ = rawCfg.size.height;
+        strideBytes_ = rawCfg.stride;
+        fmt_ = rawCfg.pixelFormat;
+
         std::cout << "RAW configured: "
-                  << rawCfg.size.width << "x" << rawCfg.size.height
-                  << " stride=" << rawCfg.stride
-                  << " fmt=" << rawCfg.pixelFormat.toString()
+                  << W_ << "x" << H_
+                  << " stride=" << strideBytes_
+                  << " fmt=" << fmt_.toString()
+                  << " buffers=" << rawCfg.bufferCount
                   << "\n";
-        Stream *rawStream = rawCfg.stream();
-        if (!rawStream) throw std::runtime_error("raw stream null");
 
-        const int W = rawCfg.size.width;
-        const int H = rawCfg.size.height;
-        const int strideBytes = rawCfg.stride;
-        const PixelFormat fmt = rawCfg.pixelFormat;
-
-        // Update globals for your "function style"
-        g_w = W;
-        g_h = H;
-
-        if (W % 4 != 0)
+        if (W_ % 4 != 0)
             throw std::runtime_error("Width not multiple of 4 (RAW10 unpack assumes this).");
 
         const bool isRaw10 =
-            (fmt == formats::SGBRG10_CSI2P) ||
-            (fmt == formats::SRGGB10_CSI2P) ||
-            (fmt == formats::SBGGR10_CSI2P) ||
-            (fmt == formats::SGRBG10_CSI2P);
-
+            (fmt_ == formats::SGBRG10_CSI2P) ||
+            (fmt_ == formats::SRGGB10_CSI2P) ||
+            (fmt_ == formats::SBGGR10_CSI2P) ||
+            (fmt_ == formats::SGRBG10_CSI2P);
         if (!isRaw10)
             throw std::runtime_error("Unexpected pixel format (not RAW10 CSI2P).");
 
-        // Allocate your return image as unsigned short** with contiguous backing.
-        unsigned short **rows = new unsigned short *[H];
-        unsigned short *base  = new unsigned short[size_t(W) * size_t(H)];
-        for (int y = 0; y < H; ++y) rows[y] = base + size_t(y) * size_t(W);
+        // Allocate buffers once.
+        alloc_ = std::make_unique<FrameBufferAllocator>(cam_);
+        if (alloc_->allocate(rawStream_) < 0)
+            throw std::runtime_error("FrameBuffer allocation failed");
 
-        // Ensure all libcamera-owned objects die before cm.stop()
-        {
-            FrameBufferAllocator alloc(cam);
-            if (alloc.allocate(rawStream) < 0)
-                throw std::runtime_error("FrameBuffer allocation failed");
+        bufs_ = &alloc_->buffers(rawStream_);
+        if (!bufs_ || bufs_->empty())
+            throw std::runtime_error("No buffers from allocator");
 
-            const auto &bufs = alloc.buffers(rawStream);
-            if (bufs.empty())
-                throw std::runtime_error("No buffers from allocator");
+        // Start camera once.
+        cam_->requestCompleted.connect(this, &PersistentRawCapture::onComplete);
+        if (cam_->start() != 0)
+            throw std::runtime_error("Camera start failed");
 
-            // We expect 2 buffers because rawCfg.bufferCount = 2.
-            if (bufs.size() < 2)
-                throw std::runtime_error("Need at least 2 buffers for dummy+real capture");
-
-            FrameBuffer *fbDummy = bufs[0].get();
-            FrameBuffer *fbReal  = bufs[1].get();
-
-            std::unique_ptr<Request> reqDummy = cam->createRequest();
-            if (!reqDummy) throw std::runtime_error("createRequest(dummy) failed");
-            if (reqDummy->addBuffer(rawStream, fbDummy) != 0)
-                throw std::runtime_error("addBuffer(dummy) failed");
-
-            std::unique_ptr<Request> reqReal = cam->createRequest();
-            if (!reqReal) throw std::runtime_error("createRequest(real) failed");
-            if (reqReal->addBuffer(rawStream, fbReal) != 0)
-                throw std::runtime_error("addBuffer(real) failed");
-
-            // Manual exposure + allow long shutter by matching frame duration.
-            auto setControls = [&](libcamera::Request *r) {
-                r->controls().set(controls::AeEnable, false);
-                r->controls().set(controls::ExposureTime, exposure_us);
-                std::array<int64_t, 2> frameDur = { (int64_t)exposure_us, (int64_t)exposure_us };
-                r->controls().set(controls::FrameDurationLimits, frameDur);
-                r->controls().set(controls::AnalogueGain, 8.0f);
-            };
-
-            setControls(reqDummy.get());
-            setControls(reqReal.get());
-
-            // Prepare callback state.
-            rawStream_ = rawStream;
-            completedFb_ = nullptr;
-
-            cam->requestCompleted.connect(this, &OneShotRawCapture::onComplete);
-
-            if (cam->start() != 0)
-                throw std::runtime_error("Camera start failed");
-
-            // ---- 1) Queue dummy request and wait (discard result) ----
-            stage_ = 0;
-            done_ = false;
-            status_ = Request::RequestCancelled;
-
-            if (cam->queueRequest(reqDummy.get()) != 0) {
-                cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
-                cam->stop();
-                throw std::runtime_error("queueRequest(dummy) failed");
-            }
-
-            {
-                std::unique_lock<std::mutex> lk(m_);
-                cv_.wait(lk, [&]{ return done_.load(); });
-            }
-
-            if (status_ != Request::RequestComplete) {
-                cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
-                cam->stop();
-                throw std::runtime_error("Dummy request did not complete");
-            }
-
-            // ---- 2) Queue real request and wait (use this one) ----
-            stage_ = 1;
-            done_ = false;
-            status_ = Request::RequestCancelled;
-            completedFb_ = nullptr;
-
-            if (cam->queueRequest(reqReal.get()) != 0) {
-                cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
-                cam->stop();
-                throw std::runtime_error("queueRequest(real) failed");
-            }
-
-            {
-                std::unique_lock<std::mutex> lk(m_);
-                cv_.wait(lk, [&]{ return done_.load(); });
-            }
-
-            cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
-            cam->stop();
-
-            if (status_ != Request::RequestComplete)
-                throw std::runtime_error("Real request did not complete");
-            if (!completedFb_)
-                throw std::runtime_error("Real request completed but framebuffer was not captured");
-
-            // Map and unpack
-            const auto &p0 = completedFb_->planes()[0];
-            int fd = p0.fd.get();
-            size_t mapLen = p0.length;
-
-            void *map = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, fd, 0);
-            if (map == MAP_FAILED)
-                throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
-
-            const uint8_t *src8 = static_cast<const uint8_t *>(map);
-
-            // CASE 1: RAW10 CSI2 packed (4 pixels -> 5 bytes)
-            const bool isCSI2P =
-                (fmt == formats::SGBRG10_CSI2P) ||
-                (fmt == formats::SRGGB10_CSI2P) ||
-                (fmt == formats::SBGGR10_CSI2P) ||
-                (fmt == formats::SGRBG10_CSI2P);
-
-            if (isCSI2P) {
-                for (int y = 0; y < H; ++y) {
-                    const uint8_t *rowPacked = src8 + size_t(y) * size_t(strideBytes);
-                    uint16_t *rowOut = reinterpret_cast<uint16_t *>(rows[y]);
-                    unpack_raw10_csi2p_row(rowPacked, W, rowOut);
-                }
-            } else {
-                // CASE 2: Unpacked RAW10 in 16-bit words (common at full-res modes)
-                // Each pixel is uint16 in memory; valid range is still 0..1023.
-                for (int y = 0; y < H; ++y) {
-                    const uint16_t *row16 = reinterpret_cast<const uint16_t *>(
-                        src8 + size_t(y) * size_t(strideBytes)
-                    );
-                    uint16_t *rowOut = reinterpret_cast<uint16_t *>(rows[y]);
-
-                    for (int x = 0; x < W; ++x) {
-                        // Some pipelines store RAW10 either:
-                        // - in the low 10 bits, or
-                        // - left-shifted (e.g., bits 15..6).
-                        // We'll detect by checking magnitude:
-                        uint16_t v = row16[x];
-
-                        // Heuristic: if values look like multiples of 64 and mostly > 1023, shift down.
-                        if (v > 1023) v >>= 6;
-
-                        rowOut[x] = v & 0x03FF;
-                    }
-                }
-            }
-
-            munmap(map, mapLen);
+        // Warm up: capture and discard a few frames so controls/pipe settle.
+        for (int i = 0; i < warmupFrames_; ++i) {
+            capture_into_internal(/*exposure_us=*/30000, /*gain=*/1.0f, /*discard=*/true);
         }
 
-        cam->release();
-        cam.reset();
-        cm.stop();
+        // Update globals for your "function style"
+        g_w = W_;
+        g_h = H_;
+    }
 
-        return rows;
+    ~PersistentRawCapture() {
+        try {
+            if (cam_) {
+                cam_->requestCompleted.disconnect(this, &PersistentRawCapture::onComplete);
+                cam_->stop();
+                cam_->release();
+                cam_.reset();
+            }
+            cm_.stop();
+        } catch (...) {
+            // destructor must not throw
+        }
+    }
+
+    int width() const { return W_; }
+    int height() const { return H_; }
+
+    // Capture one RAW Bayer frame into a freshly allocated unsigned short**.
+    // Returned values are RAW10 (0..1023) stored in uint16.
+    unsigned short **capture_bayer_u16(int exposure_us, float gain = 1.0f) {
+        // Allocate return image as unsigned short** with contiguous backing.
+        unsigned short **rows = new unsigned short *[H_];
+        unsigned short *base  = new unsigned short[size_t(W_) * size_t(H_)];
+        for (int y = 0; y < H_; ++y) rows[y] = base + size_t(y) * size_t(W_);
+
+        try {
+            capture_into(rows, exposure_us, gain);
+            return rows;
+        } catch (...) {
+            free_img(rows);
+            throw;
+        }
     }
 
 private:
+    // libcamera lifetime members
+    libcamera::CameraManager cm_;
+    std::shared_ptr<libcamera::Camera> cam_;
+    std::unique_ptr<libcamera::CameraConfiguration> cfg_;
     libcamera::Stream *rawStream_ = nullptr;
-    int stage_ = 0; // 0 = dummy, 1 = real
+    std::unique_ptr<libcamera::FrameBufferAllocator> alloc_;
+    const std::vector<std::unique_ptr<libcamera::FrameBuffer>> *bufs_ = nullptr;
+
+    // configured stream properties
+    int reqW_ = 0, reqH_ = 0;
+    int bufferCount_ = 0;
+    int warmupFrames_ = 0;
+    int W_ = 0, H_ = 0;
+    int strideBytes_ = 0;
+    libcamera::PixelFormat fmt_;
+
+    // synchronization for one in-flight request
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    libcamera::Request::Status status_ = libcamera::Request::RequestCancelled;
     libcamera::FrameBuffer *completedFb_ = nullptr;
+
+    // Choose a buffer index for the next capture. Single-flight means we can just alternate.
+    size_t nextBuf_ = 0;
 
     void onComplete(libcamera::Request *req) {
         status_ = req->status();
-
-        // When capturing the real frame, remember the framebuffer so the main thread can mmap it.
-        if (stage_ == 1 && rawStream_) {
+        if (rawStream_) {
             auto it = req->buffers().find(rawStream_);
             if (it != req->buffers().end())
                 completedFb_ = it->second;
         }
-
         {
             std::lock_guard<std::mutex> lk(m_);
-            done_.store(true);
+            done_ = true;
         }
         cv_.notify_one();
     }
 
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::atomic<bool> done_{false};
-    libcamera::Request::Status status_{libcamera::Request::RequestCancelled};
-};
+    void setControls(libcamera::Request *r, int exposure_us, float gain) {
+        using namespace libcamera;
+        r->controls().set(controls::AeEnable, false);
+        r->controls().set(controls::ExposureTime, exposure_us);
 
+        // Many pipelines clamp ExposureTime unless FrameDurationLimits is also set.
+        std::array<int64_t, 2> frameDur = { (int64_t)exposure_us, (int64_t)exposure_us };
+        r->controls().set(controls::FrameDurationLimits, frameDur);
+
+        r->controls().set(controls::AnalogueGain, gain);
+    }
+
+    void capture_into(unsigned short **rows, int exposure_us, float gain) {
+        // one request, one buffer, wait for completion, then mmap/unpack into rows
+        capture_into_internal(exposure_us, gain, /*discard=*/false, rows);
+    }
+
+    void capture_into_internal(int exposure_us, float gain, bool discard, unsigned short **rowsOut = nullptr) {
+        using namespace libcamera;
+
+        if (!bufs_ || bufs_->empty())
+            throw std::runtime_error("No buffers available");
+
+        // Pick a buffer (single-flight: safe).
+        FrameBuffer *fb = (*bufs_)[nextBuf_ % bufs_->size()].get();
+        nextBuf_++;
+
+        std::unique_ptr<Request> req = cam_->createRequest();
+        if (!req)
+            throw std::runtime_error("createRequest failed");
+
+        if (req->addBuffer(rawStream_, fb) != 0)
+            throw std::runtime_error("addBuffer failed");
+
+        setControls(req.get(), exposure_us, gain);
+
+        // Arm wait state
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            done_ = false;
+            status_ = Request::RequestCancelled;
+            completedFb_ = nullptr;
+        }
+
+        if (cam_->queueRequest(req.get()) != 0)
+            throw std::runtime_error("queueRequest failed");
+
+        {
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&]{ return done_; });
+        }
+
+        if (status_ != Request::RequestComplete)
+            throw std::runtime_error("Request did not complete");
+        if (!completedFb_)
+            throw std::runtime_error("Request completed but framebuffer was not captured");
+
+        if (discard)
+            return;
+
+        if (!rowsOut)
+            throw std::runtime_error("rowsOut is null");
+
+        // Map and unpack
+        const auto &p0 = completedFb_->planes()[0];
+        int fd = p0.fd.get();
+        size_t mapLen = p0.length;
+
+        void *map = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED)
+            throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
+
+        const uint8_t *src8 = static_cast<const uint8_t *>(map);
+
+        // RAW10 CSI2 packed (4 pixels -> 5 bytes)
+        for (int y = 0; y < H_; ++y) {
+            const uint8_t *rowPacked = src8 + size_t(y) * size_t(strideBytes_);
+            uint16_t *rowOut = reinterpret_cast<uint16_t *>(rowsOut[y]);
+            unpack_raw10_csi2p_row(rowPacked, W_, rowOut);
+        }
+
+        munmap(map, mapLen);
+    }
+};
 // The function you asked for:
 unsigned short **get_img(int microsec) {
     try {
-        OneShotRawCapture cap;
-        return cap.capture_bayer_u16(microsec);
+        // Persistent camera instance: initialize once, reuse across calls.
+        static PersistentRawCapture cap(/*reqW=*/2592, /*reqH=*/1944, /*buffers=*/6, /*warmupFrames=*/3);
+        g_w = cap.width();
+        g_h = cap.height();
+        return cap.capture_bayer_u16(microsec, /*gain=*/1.0f);
     } catch (const std::exception &e) {
         std::cerr << "get_img ERROR: " << e.what() << "\n";
         return nullptr;
@@ -353,7 +349,7 @@ int main(int argc, char **argv) {
     const int H = get_img_h();
 
     std::cout << "Captured " << W << "x" << H
-              << " RAW Bayer (uint16 values, RAW10 valid)\n";
+              << " RAW Bayer (uint16 values, RAW10 valid) [persistent pipeline]\n";
 
     // Save to ~/test.raw (uint16 little-endian, row-major)
     const std::string outPath = home_path("test.raw");
@@ -371,6 +367,7 @@ int main(int argc, char **argv) {
     f.close();
     std::cout << "Wrote: " << outPath << " ("
               << (size_t(W) * size_t(H) * 2) << " bytes)\n";
+    std::cout << "Tip: For cleaner RAW, prefer longer exposure over high gain; adjust gain in get_img() if needed.\n";
 
     free_img(img);
     return 0;
