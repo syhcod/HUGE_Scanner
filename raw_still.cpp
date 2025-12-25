@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -157,12 +158,18 @@ public:
             if (req->addBuffer(rawStream, fb) != 0)
                 throw std::runtime_error("addBuffer failed");
 
-            // Manual exposure
+            // Manual exposure + allow long shutter by matching frame duration.
             req->controls().set(controls::AeEnable, false);
             req->controls().set(controls::ExposureTime, exposure_us);
 
-            // If you want fixed gain too, uncomment:
-            // req->controls().set(controls::AnalogueGain, 1.0f);
+            // Many pipelines clamp ExposureTime unless you also relax FrameDurationLimits.
+            // FrameDurationLimits is [min, max] in microseconds.
+            std::array<int64_t, 2> frameDur = { (int64_t)exposure_us, (int64_t)exposure_us };
+            req->controls().set(controls::FrameDurationLimits, frameDur);
+
+            // Give the RAW stream some gain so you don't end up with near-zero pixels.
+            // Tune as needed (1.0 ~ 16.0). Start around 4~8.
+            req->controls().set(controls::AnalogueGain, 8.0f);
 
             done_ = false;
             status_ = Request::RequestCancelled;
@@ -171,6 +178,9 @@ public:
 
             if (cam->start() != 0)
                 throw std::runtime_error("Camera start failed");
+
+            // Warm up the sensor/pipeline. The very first frame after start() can be near-black.
+            usleep(200 * 1000); // 200 ms
 
             if (cam->queueRequest(req.get()) != 0) {
                 cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
