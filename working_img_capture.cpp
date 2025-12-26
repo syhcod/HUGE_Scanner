@@ -1,3 +1,4 @@
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -6,7 +7,6 @@
 #include <cstring>
 #include <mutex>
 #include <condition_variable>
-#include <fstream>
 
 #include <errno.h>
 #include <sys/mman.h>
@@ -16,22 +16,23 @@
 
 #include <libcamera/libcamera.h>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 using namespace libcamera;
 
-// Globals
 static std::shared_ptr<Camera> camera;
 
 // stream + geometry for callback
 static Stream *gStream = nullptr;
 static int gW = 0, gH = 0, gStride = 0;
-static PixelFormat gFmt;
 
 // one-shot sync + storage
 static std::mutex gMtx;
 static std::condition_variable gCv;
 static bool gotImage = false;
 static int discardLeft = 8;                 // discard first N frames
-static std::vector<uint8_t> capturedRaw;    // size = gStride * gH (includes padding)
+static std::vector<uint8_t> capturedBgr;    // size = gStride * gH (includes padding)
 
 static void requestComplete(Request *request)
 {
@@ -91,7 +92,7 @@ static void requestComplete(Request *request)
 
     {
         std::lock_guard<std::mutex> lk(gMtx);
-        capturedRaw.assign(src, src + frameBytes); // copy bytes (includes stride padding)
+        capturedBgr.assign(src, src + frameBytes); // FAST: just copy bytes
         gotImage = true;
     }
 
@@ -105,13 +106,12 @@ static void requestComplete(Request *request)
     munmap(map, mapLen);
 
     gCv.notify_one();
-    // Do NOT requeue; we want a single still.
+
+    // DO NOT requeue after we captured one still.
 }
 
 int main()
 {
-    const std::string outPath = "/home/kde/test.raw";
-
     auto cm = std::make_unique<CameraManager>();
     cm->start();
 
@@ -128,18 +128,13 @@ int main()
         return EXIT_FAILURE;
     }
 
-    // RAW configuration
-    auto config = camera->generateConfiguration({ StreamRole::Raw });
-    if (!config) {
-        std::cerr << "generateConfiguration failed\n";
-        return EXIT_FAILURE;
-    }
-
+    auto config = camera->generateConfiguration({ StreamRole::StillCapture });
     StreamConfiguration &streamConfig = config->at(0);
 
-    // Optional: you can request a size, but validate() may adjust.
-    // streamConfig.size.width  = 2592;
-    // streamConfig.size.height = 1944;
+    // You can request BGR888, but validate() may adjust.
+    streamConfig.pixelFormat = formats::BGR888;
+    streamConfig.size.width  = 2592;
+    streamConfig.size.height = 1944;
     streamConfig.bufferCount = 4;
 
     auto status = config->validate();
@@ -158,7 +153,6 @@ int main()
     gW = (int)streamConfig.size.width;
     gH = (int)streamConfig.size.height;
     gStride = (int)streamConfig.stride;
-    gFmt = streamConfig.pixelFormat;
 
     Stream *stream = streamConfig.stream();
     gStream = stream;
@@ -177,7 +171,7 @@ int main()
         return EXIT_FAILURE;
     }
 
-    // Build one Request per buffer and queue them all
+    // Build one Request per buffer and queue them all (important!)
     std::vector<std::unique_ptr<Request>> requests;
     requests.reserve(buffers.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
@@ -197,7 +191,7 @@ int main()
     {
         std::lock_guard<std::mutex> lk(gMtx);
         gotImage = false;
-        capturedRaw.clear();
+        capturedBgr.clear();
     }
     discardLeft = 8;
 
@@ -220,28 +214,30 @@ int main()
     camera->requestCompleted.disconnect(requestComplete);
     camera->stop();
 
-    if (capturedRaw.size() < (size_t)gStride * (size_t)gH) {
+    // Convert captured BGR(stride) -> packed RGB and write PNG
+    if (capturedBgr.size() < (size_t)gStride * (size_t)gH) {
         std::cerr << "Captured buffer too small\n";
         return EXIT_FAILURE;
     }
 
-    // Write raw bytes (packed RAW with stride)
-    {
-        std::ofstream f(outPath, std::ios::binary);
-        if (!f) {
-            std::cerr << "Failed to open output: " << outPath << "\n";
-            return EXIT_FAILURE;
+    std::vector<uint8_t> rgb((size_t)gW * (size_t)gH * 3);
+    for (int y = 0; y < gH; ++y) {
+        const uint8_t *srcRow = capturedBgr.data() + (size_t)y * (size_t)gStride;
+        uint8_t *dstRow = rgb.data() + (size_t)y * (size_t)gW * 3;
+        for (int x = 0; x < gW; ++x) {
+            uint8_t B = srcRow[3 * x + 0];
+            uint8_t G = srcRow[3 * x + 1];
+            uint8_t R = srcRow[3 * x + 2];
+            dstRow[3 * x + 0] = R;
+            dstRow[3 * x + 1] = G;
+            dstRow[3 * x + 2] = B;
         }
-        f.write(reinterpret_cast<const char *>(capturedRaw.data()),
-                static_cast<std::streamsize>(capturedRaw.size()));
     }
 
-    std::cout << "Saved RAW: " << outPath
-              << " fmt=" << gFmt.toString()
-              << " size=" << gW << "x" << gH
-              << " stride=" << gStride
-              << " bytes=" << capturedRaw.size()
-              << "\n";
+    if (!stbi_write_png("/home/kde/test.png", gW, gH, 3, rgb.data(), gW * 3))
+        std::cerr << "Failed to write PNG\n";
+    else
+        std::cout << "Saved PNG: /home/kde/test.png (" << gW << "x" << gH << ")\n";
 
     // cleanup
     allocator.reset();
